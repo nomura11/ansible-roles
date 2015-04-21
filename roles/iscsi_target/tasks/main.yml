@@ -1,0 +1,6 @@
+---
+- name: Install targetcli
+  yum: name=targetcli state=present
+
+- name: Create iSCSI target
+  iscsi_target: initiators="{{iscsi_target_allowed_iqns}}" backstores="{{iscsi_target_backstores}}" name="{{iscsi_target_disk_name}}" path_groups="{{iscsi_target_path_groups}}"

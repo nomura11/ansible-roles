@@ -1,0 +1,30 @@
+host1
+host2
+
+[docker-common:children]
+docker
+docker-registry
+
+[docker-common:vars]
+insecure_registry = host1:5000
+
+[docker-registry]
+host1
+
+[docker]
+host2
+
+[iscsi_target]
+host1
+
+[iscsi_target:vars]
+iscsi_target_backstores=/dev/vdb
+iscsi_target_disk_name=TestDisk
+iscsi_target_path_groups=2A:2S
+iscsi_target_allowed_iqns=iqn.2015-04.com.local:123456789a
+
+[iscsi_initiator]
+host2 iscsi_initiator_name=iqn.2015-04.com.local:123456789a
+
+[iscsi_initiator:vars]
+iscsi_initiator_target_hosts=host1

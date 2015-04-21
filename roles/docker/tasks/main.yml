@@ -1,0 +1,10 @@
+---
+- name: Install docker
+  yum: name=docker state=present
+
+- name: Enable local registry
+  shell: sed -i "s/^# \(INSECURE_REGISTRY='--insecure-registry\)'/\1 {{insecure_registry}}'/" /etc/sysconfig/docker
+  when: insecure_registry is defined
+
+- name: Start docker
+  service: name=docker state=started enabled=yes

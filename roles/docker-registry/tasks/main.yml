@@ -1,0 +1,6 @@
+---
+- name: Install docker-registry
+  yum: name=docker-registry state=present
+
+- name: Start docker-registry
+  service: name=docker-registry state=started enabled=yes

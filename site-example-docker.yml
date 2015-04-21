@@ -1,0 +1,12 @@
+- name: Start Registry
+  hosts: docker-registry
+  roles:
+    - docker
+    - docker-registry
+
+- name: Start Dockers
+  gather_facts: False
+  hosts: docker
+  roles:
+    - docker
+

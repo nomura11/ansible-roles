@@ -1,0 +1,11 @@
+- name: Target
+  gather_facts: False
+  hosts: iscsi_target
+  roles:
+    - iscsi_target
+
+- name: Initiator
+  gather_facts: False
+  hosts: iscsi_initiator
+  roles:
+    - iscsi_initiator

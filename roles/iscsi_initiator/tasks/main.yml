@@ -1,0 +1,28 @@
+---
+- name: Install tools
+  yum: name="{{item}}" state=present
+  with_items:
+    - iscsi-initiator-utils
+    - device-mapper-multipath
+    - sg3_utils
+    - lsscsi
+
+- name: Set initiator name
+  template: src=initiatorname.iscsi dest=/etc/iscsi/ mode=0644
+
+- name: Set dm-multipath
+  copy: src=multipath.conf dest=/etc/ mode=0644
+
+# FIXME: should handle multiple targets
+- name: Discover
+  shell: iscsiadm -m discovery -t st -p "{{iscsi_initiator_target_hosts}}"
+
+- name: Login
+  shell: iscsiadm -m node --login
+
+- name: Services
+  service: name="{{item}}" state=started enabled=yes
+  with_items:
+    - iscsi
+    - multipathd
+

@@ -1,0 +1,328 @@
+#!/bin/bash
+
+# scsi_target_backstore
+# Create a LIO backstore
+
+# parameters
+backstores=/root/File1.img
+name=Backstore1
+size=1GB
+path_groups=2A:2S
+baseworkdir=$HOME/.iscsi_target/work
+confdir=/sys/kernel/config/target
+initiators=
+
+# read args
+. $1
+
+######################################################################
+workdir=$baseworkdir/$name
+logfile=$baseworkdir/$name/create.log
+mkdir -p $workdir
+
+######################################################################
+# For ansible
+#
+
+# redirect anything to logfile but ansible response
+exec 3>>/dev/stdout >> $logfile 2>&1
+
+changed=false
+failed=false
+rc=0
+exit_ansible() {
+	local x
+	if [ "$1" != "" ]; then
+		rc=$1
+	fi
+	if [ "$rc" != "0" ]; then
+		failed=true
+	fi
+	if [ ! -z "$msg" ]; then
+		x=", \"msg\": \"$msg\""
+	fi
+	echo "{ \"rc\": $rc, \"changed\": $changed, \"failed\": $failed $x }" >&3
+	exit $rc
+}
+
+is_true() {
+	local var=$1
+
+	if [ -z "$var" ]; then
+		return 1
+	fi
+	if [ "$var" = "0" ]; then
+		return 1
+	fi
+	if (echo "$var" | grep -qi "^\(false\|no\)$"); then
+		return 1
+	fi
+
+	return 0
+}
+
+# --------------------------------------------------------------
+# Common function
+
+function config_check_and_set {
+	local conffile=$1
+	local val=$2
+	local cur=$(cat $conffile)
+
+	# Do nothing if already set
+	if [ "$cur" = "$val" ]; then
+		echo "$conffile is already $val"
+		return 0
+	fi
+
+	# Set value
+	echo "Set $conffile as $val"
+	echo $val > "$conffile"
+	changed=true
+
+	# Re-read and check
+	cur=$(cat $conffile)
+	if [ "$cur" != "$val" ]; then
+		echo "Failed to set $conffile as $val"
+		return 1
+	fi
+	return 0
+}
+
+# --------------------------------------------------------------
+# Create backstore
+
+if [ -z "$backstores" -o -z "$name" ]; then
+	exit_ansible 1
+fi
+
+function backstore_exists {
+	local driver=$1
+	local name=$2
+	local backstore=$3
+
+	for d in $confdir/core/${driver}_[0-9]*; do
+		if [ -d $d/$name ]; then
+			# found
+			if [ -n $backstore ]; then
+				echo "Checking $d/$name/info for $backstore"
+				grep $backstore $d/$name/info
+				return $?
+			fi
+			return 0
+		fi
+	done
+
+	# Not found
+	return 1
+}
+
+function create_backstore {
+	if [ -b "$backstore" ]; then
+		# Block
+		kdrv="iblock"
+		udrv="block"
+		arg3=""
+	elif [ -n "$size" ]; then
+		# FileIO
+		kdrv="fileio"
+		udrv="fileio"
+		arg3="$size"
+	else
+		echo "Unknown backstore type: $backstore / $size"
+		exit_ansible 1
+	fi
+
+	lioname="/backstores/$udrv/$name"
+
+	# Do nothing if already exists
+	if backstore_exists "$kdrv" "$name" "$backstore"; then
+		return
+	fi
+
+	# Create backstore
+	echo "/backstores/$udrv create $name $backstore $arg3"
+	targetcli "/backstores/$udrv create $name $backstore $arg3"
+	changed=true
+
+	# Confirm
+	if ! backstore_exists "$kdrv" "$name" "$backstore"; then
+		echo "Failed to create backstore: $name / $backstore / $kdrv"
+		exit_ansible 1
+	fi
+}
+
+for backstore in $backstores; do
+	create_backstore
+done
+
+# --------------------------------------------------------------
+# Create ALUA target group and set ID
+
+num_pgs=$(echo $path_groups | awk -F: '{print NR}')
+
+stodir=$(echo $confdir/core/*/$name)
+if [ ! -d $stodir ]; then
+	echo "Config directory for $name not found: $stodir"
+	exit_ansible 1
+fi
+
+gpid=1
+for gp in $(echo $path_groups | sed 's/:/ /'); do
+	gpname="lio${gpid}_gp"
+	gpdir="$stodir/alua/$gpname"
+	if [ ! -d "$gpdir" ]; then
+		mkdir "$gpdir"
+		changed=true
+	fi
+	if [ ! -d "$gpdir" ]; then
+		echo "Failed to create TPG: $gpdir"
+		exit_ansible 1
+	fi
+
+	config_check_and_set "$gpdir/tg_pt_gp_id" "$gpid"
+	if [ $? -ne 0 ]; then
+		exit_ansible 1
+	fi
+
+	# Mark group as preferred
+	if (echo $gp | grep -q 'P'); then
+		config_check_and_set "$gpdir/preferred" "1"
+		if [ $? -ne 0 ]; then
+			exit_ansible 1
+		fi
+	fi
+
+	# Set standby group state
+	#   0: Active/Optimized
+	#   1: Active/Non-optimized
+	#   2: Standby
+	#   3: Unavailable
+	if (echo $gp | grep -q 'A'); then
+		gstate="Active/Optimized"
+		gstateval="0"
+	elif (echo $gp | grep -q 'N'); then
+		gstate="Active/Non-optimized"
+		gstateval="1"
+	elif (echo $gp | grep -q 'S'); then
+		gstate="Standby"
+		gstateval="2"
+	elif (echo $gp | grep -q 'U'); then
+		gstate="Unavailable"
+		gstateval="3"
+	else
+		echo "Unknown group description: $gp"
+		exit_ansible 1
+	fi
+
+	config_check_and_set "$gpdir/alua_access_state" "$gstateval"
+	if [ $? -ne 0 ]; then
+		exit_ansible 1
+	fi
+
+	gpid=$((gpid + 1))
+done
+
+# --------------------------------------------------------------
+# Setup iSCSI portals
+
+# Assume portals == paths-to-LU
+nr_portals=0
+for gp in $(echo $path_groups | sed 's/:/ /'); do
+	paths=$(echo $gp | sed 's/^\([0-9]*\).*$/\1/')
+	nr_portals=$((nr_portals + paths))
+done
+
+nr_iqns=$(ls -1d $confdir/iscsi/iqn.* 2>/dev/null | wc -l)
+if [ "$nr_portals" != "$nr_iqns" ]; then
+	for x in $(seq $(($nr_portals - $nr_iqns))); do
+		targetcli "/iscsi create"
+	done
+	changed=true
+fi
+nr_iqns=$(ls -1d $confdir/iscsi/iqn.* 2>/dev/null | wc -l)
+if [ "$nr_portals" != "$nr_iqns" ]; then
+	echo "Could not create sufficient number of iSCSI portals"
+	exit_ansible 1
+fi
+
+# Array of iqn directories
+iqndirs=($(ls -1d $confdir/iscsi/iqn.*))
+
+# Bind LUs to portals
+for iqndir in ${iqndirs[@]}; do
+	iqn=$(basename $iqndir)
+	# FIXME: should handle multiple backstores
+	# FIXME: should not set changed=true needlessly
+	echo "Bind $lioname to $iqn"
+	echo "/iscsi/$iqn/tpg1/luns create $lioname"
+	targetcli "/iscsi/$iqn/tpg1/luns create $lioname"
+	changed=true
+done
+
+# Assign LUs to group
+ind=0
+gpid=1
+for gp in $(echo $path_groups | sed 's/:/ /'); do
+	paths=$(echo $gp | sed 's/^\([0-9]*\).*$/\1/')
+	gpname="lio${gpid}_gp"
+
+	subind=0
+	while [ "$subind" -lt "$paths" ]; do
+		iqndir=${iqndirs[$ind]}
+
+		for d in $(ls -1d $iqndir/tpgt_1/lun/lun_*); do
+			conffile="$d/alua_tg_pt_gp"
+			val="$gpname"
+			cur=$(sed -n 's/^TG Port Alias: \(.*\)/\1/p' $conffile)
+			if [ "$cur" = "$val" ]; then
+				echo "$conffile is already $val"
+				continue
+			fi
+			# Set value
+			echo "Set $conffile as $val"
+			echo $val > "$conffile"
+			changed=true
+			# Re-read and check
+			cur=$(sed -n 's/^TG Port Alias: \(.*\)/\1/p' $conffile)
+			if [ "$cur" != "$val" ]; then
+				echo "Failed to set $conffile as $val"
+				exit_ansible 1
+			fi
+		done
+
+		subind=$((subind + 1))
+		ind=$((ind + 1))
+	done
+
+	gpid=$((gpid + 1))
+done
+
+# Offline standby ports
+#basedir="/sys/kernel/config/target/iscsi"
+#for iqn in $standby_wwns; do
+#	echo 1 > "$basedir/$iqn/tpgt_1/lun/lun_0/alua_tg_pt_offline"
+#done
+
+# --------------------------------------------------------------
+# Create ACLs for iSCSI portals
+
+#. /etc/iscsi/initiatorname.iscsi
+#clientiqn=$InitiatorName
+#clientiqn=iqn.1994-05.com.redhat:439273c481a
+iqndirs=($(ls -1d $confdir/iscsi/iqn.*))
+for iqndir in ${iqndirs[@]}; do
+	iqn=$(basename $iqndir)
+	# FIXME: cannot we allow 'all' nodes?
+	# FIXME: should not set changed=true needlessly
+	for node in $initiators; do
+		echo "/iscsi/$iqn/tpg1/acls create $node"
+		targetcli "/iscsi/$iqn/tpg1/acls create $node"
+	done
+	changed=true
+done
+
+# iscsiadm -m discoverydb -t st -p $(hostname -s) --discover
+# iscsiadm -m node --login
+
+exit_ansible
